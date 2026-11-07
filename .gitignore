@@ -1,0 +1,16 @@
+build/
+*.obj
+*.exe
+*.dll
+*.lib
+*.a
+*.pdb
+*.ilk
+*.exp
+*.map
+
+# 测试产物
+target_out.txt
+target_pid.txt
+pid.txt
+t.txt
