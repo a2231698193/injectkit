@@ -7,6 +7,7 @@
 #include <windows.h>
 
 #include <cstdio>
+#include <cmath>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -17,6 +18,7 @@
 #include "common/rnd.hpp"
 #include "payload/json.hpp"
 #include "payload/mem.hpp"
+#include "payload/call.hpp"
 #include "payload/rpc.hpp"
 #include "stealth/api.hpp"
 
@@ -285,6 +287,158 @@ void test_rpc() {
     }
 }
 
+
+// ---------------------------------------------------------------- call
+void test_call_basics() {
+    std::printf("--- call: 基础 ---\n");
+
+    // 零参数 + 64 位返回
+    const auto tickAddr = reinterpret_cast<uint64_t>(
+        GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetTickCount64"));
+    {
+        const auto r = ik::call::invoke(tickAddr, nullptr, 0, ik::call::ArgType::Int);
+        check(r.rax > 0, "GetTickCount64 返回非零");
+    }
+
+    // 单参数
+    {
+        const auto addr = reinterpret_cast<uint64_t>(
+            GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetCurrentThreadId"));
+        const auto r = ik::call::invoke(addr, nullptr, 0, ik::call::ArgType::Int);
+        check(r.rax == GetCurrentThreadId(), "GetCurrentThreadId 匹配");
+    }
+
+    // 空地址
+    {
+        const auto r = ik::call::invoke(0, nullptr, 0, ik::call::ArgType::Int);
+        check(r.rax == 0, "空地址返回 0");
+    }
+}
+
+void test_call_shadow_space() {
+    std::printf("--- call: 影子空间与多参数 ---\n");
+
+    // 7 个参数：CreateFileW —— 最容易暴露影子空间/压栈错误
+    const auto addr = reinterpret_cast<uint64_t>(
+        GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "CreateFileW"));
+    check(addr != 0, "找到 CreateFileW");
+
+    if (addr) {
+        // 打开一个不存在的文件，期望 INVALID_HANDLE_VALUE (-1)
+        static wchar_t path[] = L"C:\__ik_selftest_nonexistent__.tmp";
+        ik::call::Arg args[7] = {
+            ik::call::Arg::i(reinterpret_cast<uint64_t>(path)),
+            ik::call::Arg::i(0x80000000),   // GENERIC_READ
+            ik::call::Arg::i(1),            // FILE_SHARE_READ
+            ik::call::Arg::i(0),
+            ik::call::Arg::i(3),            // OPEN_EXISTING
+            ik::call::Arg::i(0x80),
+            ik::call::Arg::i(0),
+        };
+        const auto r = ik::call::invoke(addr, args, 7, ik::call::ArgType::Int);
+        check(r.rax == static_cast<uint64_t>(-1), "CreateFileW(7参) 返回 INVALID_HANDLE_VALUE");
+    }
+}
+
+void test_call_float() {
+    std::printf("--- call: 浮点 ---\n");
+
+    HMODULE msvcrt = GetModuleHandleW(L"msvcrt.dll");
+    check(msvcrt != nullptr, "msvcrt 已加载");
+    if (!msvcrt) return;
+
+    // double 参数 + double 返回：pow(2, 10) = 1024
+    {
+        const auto addr = reinterpret_cast<uint64_t>(GetProcAddress(msvcrt, "pow"));
+        if (addr) {
+            ik::call::Arg args[2] = {ik::call::Arg::d(2.0), ik::call::Arg::d(10.0)};
+            const auto r = ik::call::invoke(addr, args, 2, ik::call::ArgType::Double);
+            check(std::fabs(r.as_double() - 1024.0) < 0.01, "pow(2,10) == 1024");
+        }
+    }
+
+    // float 参数 + float 返回：sqrtf(16) = 4
+    {
+        const auto addr = reinterpret_cast<uint64_t>(GetProcAddress(msvcrt, "sqrtf"));
+        if (addr) {
+            ik::call::Arg args[1] = {ik::call::Arg::f(16.0f)};
+            const auto r = ik::call::invoke(addr, args, 1, ik::call::ArgType::Float);
+            check(std::fabs(r.as_float() - 4.0f) < 0.01f, "sqrtf(16) == 4");
+        }
+    }
+
+    // 浮点参数 + 整型返回：_finite(1.5) 非零
+    {
+        const auto addr = reinterpret_cast<uint64_t>(GetProcAddress(msvcrt, "_finite"));
+        if (addr) {
+            ik::call::Arg args[1] = {ik::call::Arg::d(1.5)};
+            const auto r = ik::call::invoke(addr, args, 1, ik::call::ArgType::Int);
+            check(r.rax != 0, "_finite(1.5) 非零");
+        }
+    }
+}
+
+void test_call_rpc() {
+    std::printf("--- call: RPC 集成 ---\n");
+
+    ik::rpc::Dispatcher d;
+
+    const auto tickAddr = reinterpret_cast<uint64_t>(
+        GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetTickCount64"));
+
+    char reqJson[256];
+    snprintf(reqJson, sizeof(reqJson),
+             R"({"jsonrpc":"2.0","id":10,"method":"game.call","params":{"addr":"0x%llX"}})",
+             static_cast<unsigned long long>(tickAddr));
+
+    json::Value req;
+    check(json::parse(reqJson, req), "构造 game.call 请求");
+    const auto resp = d.dispatch(req);
+    check(resp.ok, "game.call 成功");
+    check(resp.result.get("ret_u") != nullptr, "响应含 ret_u");
+
+    // 带参数的调用
+    {
+        const auto addr = reinterpret_cast<uint64_t>(
+            GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetTickCount64"));
+        (void)addr;
+
+        // 用 GetCurrentProcessId（无参）
+        const auto pidAddr = reinterpret_cast<uint64_t>(
+            GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetCurrentProcessId"));
+        char j2[256];
+        snprintf(j2, sizeof(j2),
+                 R"({"jsonrpc":"2.0","id":11,"method":"game.call","params":{"addr":"0x%llX"}})",
+                 static_cast<unsigned long long>(pidAddr));
+        json::Value r2;
+        json::parse(j2, r2);
+        const auto resp2 = d.dispatch(r2);
+        check(resp2.ok, "GetCurrentProcessId 调用成功");
+        check(resp2.result.get_int("ret_i") == static_cast<int64_t>(GetCurrentProcessId()),
+              "返回值正确");
+    }
+
+    // 参数过多
+    {
+        json::Value r3;
+        json::parse(
+            R"({"jsonrpc":"2.0","id":12,"method":"game.call","params":{"addr":"0x1000","args":[1,2,3,4,5,6,7,8,9]}})",
+            r3);
+        const auto resp3 = d.dispatch(r3);
+        check(!resp3.ok, "参数过多被拒绝");
+        check(resp3.errorCode == ik::rpc::kInvalidParams, "错误码正确");
+    }
+
+    // 空地址
+    {
+        json::Value r4;
+        json::parse(
+            R"({"jsonrpc":"2.0","id":13,"method":"game.call","params":{"addr":"0x0"}})", r4);
+        const auto resp4 = d.dispatch(r4);
+        check(!resp4.ok, "空地址被拒绝");
+    }
+}
+
 }  // namespace
 
 int wmain() {
@@ -299,6 +453,10 @@ int wmain() {
     test_json();
     test_mem();
     test_rpc();
+    test_call_basics();
+    test_call_shadow_space();
+    test_call_float();
+    test_call_rpc();
 
     std::printf("====================================\n");
     if (g_fail == 0) {

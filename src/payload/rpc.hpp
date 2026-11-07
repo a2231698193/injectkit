@@ -26,6 +26,7 @@
 #include <cstring>
 #include <string>
 
+#include "payload/call.hpp"
 #include "payload/json.hpp"
 #include "payload/mem.hpp"
 
@@ -96,6 +97,7 @@ public:
         if (method == "mem.read") return handle_mem_read(req);
         if (method == "mem.chain") return handle_mem_chain(req);
         if (method == "mem.info") return handle_mem_info(req);
+        if (method == "game.call") return handle_game_call(req);
 
         return Response::make_error(kMethodNotFound, "unknown method");
     }
@@ -173,6 +175,77 @@ private:
             r.result.set("addr", json::Value(buf));
         }
         return r;
+    }
+
+    // 调用任意函数
+    //
+    // 参数格式：
+    //   {"method":"game.call","params":{
+    //       "addr":"0x140123456",
+    //       "args":[{"t":"i","v":"0x10"},{"t":"f","v":1.5}],
+    //       "ret":"i"}}
+    //
+    // t: i=整型/指针, f=float, d=double
+    // ret: i=整型(默认), f=float, d=double
+    //
+    // 安全边界：只执行、不修改任何字节。
+    // Warden 的 Mem 检查逐字节比对，所以"调用"安全，"hook"危险。
+    Response handle_game_call(const json::Value& req) {
+        const json::Value* p = params(req);
+        if (!p) return Response::make_error(kInvalidParams, "missing params");
+
+        const uint64_t addr = p->get_addr("addr");
+        if (addr == 0) return Response::make_error(kInvalidParams, "addr is 0");
+
+        call::ArgType retType = call::ArgType::Int;
+        const std::string retStr = p->get_str("ret", "i");
+        if (retStr == "f") retType = call::ArgType::Float;
+        else if (retStr == "d") retType = call::ArgType::Double;
+
+        call::Arg argv[call::kMaxArgs];
+        size_t argc = 0;
+        const json::Value* argsArr = p->get("args");
+        if (argsArr && argsArr->is_array()) {
+            const size_t n = argsArr->size();
+            if (n > call::kMaxArgs) {
+                return Response::make_error(kInvalidParams, "too many args (max 8)");
+            }
+            for (size_t i = 0; i < n; ++i) {
+                const json::Value& a = argsArr->at(i);
+
+                if (a.is_object()) {
+                    const std::string t = a.get_str("t", "i");
+                    const json::Value* v = a.get("v");
+                    const double dv = v ? v->as_number() : 0.0;
+                    const uint64_t iv = v ? v->as_addr() : 0;
+
+                    if (t == "f") argv[argc++] = call::Arg::f(static_cast<float>(dv));
+                    else if (t == "d") argv[argc++] = call::Arg::d(dv);
+                    else argv[argc++] = call::Arg::i(iv);
+                } else {
+                    argv[argc++] = call::Arg::i(a.as_addr());
+                }
+            }
+        }
+
+        const call::Result r = call::invoke(addr, argv, argc, retType);
+
+        Response resp;
+        resp.result = json::Value::object();
+        resp.result.set("ok", json::Value(true));
+
+        if (retType == call::ArgType::Float) {
+            resp.result.set("ret_f", json::Value(static_cast<double>(r.as_float())));
+        } else if (retType == call::ArgType::Double) {
+            resp.result.set("ret_d", json::Value(r.as_double()));
+        }
+
+        char buf[32];
+        snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(r.rax));
+        resp.result.set("ret_u", json::Value(buf));
+        resp.result.set("ret_i", json::Value(static_cast<int64_t>(r.rax)));
+
+        return resp;
     }
 
     Response handle_mem_info(const json::Value& req) {

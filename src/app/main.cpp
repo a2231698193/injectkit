@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "client/rpc_client.hpp"
+#include "payload/json.hpp"
 #include "common/obf.hpp"
 
 namespace {
@@ -103,6 +104,63 @@ int wmain(int argc, wchar_t** argv) {
                 putchar(b >= 0x20 && b < 0x7F ? b : '.');
             }
             printf("\n");
+        }
+        return 0;
+    }
+
+    if (argc >= 3 && wcscmp(argv[2], L"call") == 0) {
+        if (argc < 4) { printf("需要函数地址\n"); return 1; }
+        const uint64_t addr = _wcstoui64(argv[3], nullptr, 0);
+
+        // 可选：参数列表（逗号分隔的十六进制/十进制）
+        std::string argsJson;
+        if (argc >= 5) {
+            std::wstring s(argv[4]);
+            size_t start = 0;
+            bool first = true;
+            while (start <= s.size()) {
+                const size_t comma = s.find(L',', start);
+                const std::wstring tok = s.substr(start, comma == std::wstring::npos
+                                                             ? std::wstring::npos
+                                                             : comma - start);
+                if (!tok.empty()) {
+                    if (!first) argsJson += ',';
+                    first = false;
+                    char b[32];
+                    snprintf(b, sizeof(b), "\"0x%llX\"",
+                             (unsigned long long)_wcstoui64(tok.c_str(), nullptr, 0));
+                    argsJson += b;
+                }
+                if (comma == std::wstring::npos) break;
+                start = comma + 1;
+            }
+        }
+
+        char req[768];
+        snprintf(req, sizeof(req),
+                 R"({"jsonrpc":"2.0","id":4,"method":"game.call","params":{"addr":"0x%llX","args":[%s]}})",
+                 (unsigned long long)addr, argsJson.c_str());
+
+        std::string resp;
+        if (!client.call(req, resp)) { printf("RPC 失败\n"); return 1; }
+
+        json::Value v;
+        if (!json::parse(resp, v)) { printf("响应解析失败\n"); return 1; }
+
+        const json::Value* r = v.get("result");
+        if (r) {
+            printf("\n[game.call] 0x%llX\n", (unsigned long long)addr);
+            printf("  ret_u = %s\n", r->get_str("ret_u").c_str());
+            printf("  ret_i = %lld\n", (long long)r->get_int("ret_i"));
+            const json::Value* rf = r->get("ret_f");
+            if (rf) printf("  ret_f = %.6f\n", rf->as_number());
+            const json::Value* rd = r->get("ret_d");
+            if (rd) printf("  ret_d = %.10f\n", rd->as_number());
+        } else {
+            const json::Value* e = v.get("error");
+            printf("\n[game.call] 错误: %s\n",
+                   e ? e->get_str("message").c_str() : "unknown");
+            return 1;
         }
         return 0;
     }
