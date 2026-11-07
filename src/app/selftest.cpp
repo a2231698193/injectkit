@@ -9,12 +9,15 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <vector>
 
 #include "common/hash.hpp"
 #include "common/obf.hpp"
 #include "common/ringlog.hpp"
 #include "common/rnd.hpp"
-#include "client/rpc_client.hpp"
+#include "payload/json.hpp"
+#include "payload/mem.hpp"
+#include "payload/rpc.hpp"
 #include "stealth/api.hpp"
 
 namespace {
@@ -119,58 +122,167 @@ void test_api() {
           "不存在的导出返回空");
 }
 
-// ---------------------------------------------------------------- 管道
-void test_pipe() {
-    std::printf("--- 管道链路 ---\n");
 
-    // 自建一个服务端管道，然后用 HeartbeatClient 去连，
-    // 验证 connect / read_line 的基本行为。
-    const DWORD myPid = GetCurrentProcessId();
-    wchar_t name[96] = {};
-    wsprintfW(name, L"\\\\.\\pipe\\ik_%lu", myPid);
+// ---------------------------------------------------------------- json
+void test_json() {
+    std::printf("--- json ---\n");
 
-    HANDLE server = CreateNamedPipeW(name, PIPE_ACCESS_DUPLEX,
-                                     PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-                                     1, 4096, 4096, 0, nullptr);
-    check(server != INVALID_HANDLE_VALUE, "创建测试管道");
-    if (server == INVALID_HANDLE_VALUE) return;
+    json::Value o = json::Value::object();
+    o.set("jsonrpc", json::Value("2.0"));
+    o.set("id", json::Value(static_cast<int64_t>(1)));
+    const std::string dumped = o.dump();
+    check(dumped.find("\"jsonrpc\":\"2.0\"") != std::string::npos, "序列化含字段");
+    check(dumped.find("\"id\":1") != std::string::npos, "整数不带小数点");
 
-    // 后台线程等连接
-    struct Ctx { HANDLE h; };
-    Ctx ctx{server};
+    json::Value v;
+    const char* src =
+        R"({"jsonrpc":"2.0","id":42,"method":"mem.read","params":{"addr":"0x140000000","size":4}})";
+    check(json::parse(src, v), "解析成功");
+    check(v.get_str("method") == "mem.read", "method 正确");
+    check(v.get_int("id") == 42, "id 正确");
 
-    auto acceptThread = [](LPVOID p) -> DWORD {
-        auto* c = static_cast<Ctx*>(p);
-        ConnectNamedPipe(c->h, nullptr);
-        const char msg[] = "{\"event\":\"alive\"}";
-        DWORD wrote = 0;
-        WriteFile(c->h, msg, sizeof(msg) - 1, &wrote, nullptr);
-        return 0;
-    };
-
-    HANDLE th = CreateThread(nullptr, 0, acceptThread, &ctx, 0, nullptr);
-    check(th != nullptr, "启动测试服务线程");
-
-    ik::HeartbeatClient client;
-    const bool connected = client.connect(myPid, 3000);
-    check(connected, "客户端连上管道");
-
-    if (connected) {
-        std::string line;
-        const bool got = client.read_line(line, 3000);
-        check(got, "读到事件");
-        if (got) {
-            check(line.find("alive") != std::string::npos, "事件内容正确");
-            std::printf("      收到: %s\n", line.c_str());
-        }
-        client.close();
+    const json::Value* p = v.get("params");
+    check(p != nullptr, "params 存在");
+    if (p) {
+        check(p->get_addr("addr") == 0x140000000ull, "十六进制地址解析正确");
+        check(p->get_int("size") == 4, "size 正确");
     }
 
-    if (th) {
-        WaitForSingleObject(th, 2000);
-        CloseHandle(th);
+    json::Value s(std::string("a\"b\c\nd"));
+    json::Value back;
+    check(json::parse(s.dump(), back), "转义往返解析");
+    check(back.as_string() == "a\"b\c\nd", "转义往返一致");
+
+    json::Value bad;
+    check(!json::parse("{", bad), "截断对象被拒绝");
+    check(!json::parse("", bad), "空串被拒绝");
+    check(!json::parse("[1,2", bad), "截断数组被拒绝");
+    check(!json::parse("{}x", bad), "尾部垃圾被拒绝");
+
+    json::Value arr;
+    check(json::parse(R"([1,true,null,"x"])", arr), "混合数组解析");
+    check(arr.size() == 4, "数组长度正确");
+    check(arr.at(1).as_bool(), "布尔值正确");
+    check(arr.at(2).is_null(), "null 正确");
+    check(arr.at(3).as_string() == "x", "字符串正确");
+}
+
+// ---------------------------------------------------------------- mem
+void test_mem() {
+    std::printf("--- mem ---\n");
+
+    const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+
+    uint8_t mz[2] = {};
+    size_t got = 0;
+    check(ik::mem::read(base, mz, 2, got) == ik::mem::Status::Ok, "读自身 PE 头成功");
+    check(got == 2 && mz[0] == 'M' && mz[1] == 'Z', "读到 MZ");
+
+    check(ik::mem::read(0, mz, 2, got) == ik::mem::Status::NullAddr, "空地址被拒绝");
+
+    std::vector<uint8_t> big(ik::mem::kMaxRead + 1, 0);
+    check(ik::mem::read(base, big.data(), big.size(), got) == ik::mem::Status::TooLarge,
+          "超限被拒绝");
+
+    const auto st = ik::mem::read(0x1000, mz, 2, got);
+    check(st == ik::mem::Status::NotCommitted || st == ik::mem::Status::NoAccess,
+          "未提交地址被拒绝");
+
+    void* guarded = VirtualAlloc(nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (guarded) {
+        DWORD old = 0;
+        VirtualProtect(guarded, 0x1000, PAGE_READWRITE | PAGE_GUARD, &old);
+        check(ik::mem::read(reinterpret_cast<uintptr_t>(guarded), mz, 2, got) ==
+                  ik::mem::Status::GuardPage,
+              "guard page 被识别为陷阱");
+        VirtualFree(guarded, 0, MEM_RELEASE);
     }
-    CloseHandle(server);
+
+    uint16_t mzVal = 0;
+    check(ik::mem::read_value(base, mzVal) && mzVal == 0x5A4D, "read_value 正确");
+
+    uint32_t lfanew = 0;
+    check(ik::mem::read_value(base + 0x3C, lfanew), "读 e_lfanew 成功");
+
+    uintptr_t offs[1] = {0x3C};
+    uintptr_t resolved = 0;
+    check(ik::mem::chain(base, offs, 1, resolved), "单级链解析成功");
+    check(resolved == base + 0x3C, "单级链结果正确");
+
+    uintptr_t badOffs[2] = {0x3C, 0xFFFFFF00};
+    check(!ik::mem::chain(base, badOffs, 2, resolved), "断链被识别");
+
+    check(ik::mem::probe_readable(base, 2), "probe 可读区成功");
+    check(!ik::mem::probe_readable(0, 2), "probe 空地址失败");
+    check(!ik::mem::probe_readable(0x1000, 2), "probe 未提交区失败");
+}
+
+// ---------------------------------------------------------------- rpc
+void test_rpc() {
+    std::printf("--- rpc ---\n");
+
+    ik::rpc::Dispatcher d;
+
+    {
+        json::Value req;
+        json::parse(R"({"jsonrpc":"2.0","id":1,"method":"ping","params":{}})", req);
+        const auto resp = d.dispatch(req);
+        check(resp.ok, "ping 成功");
+        check(resp.result.get_int("pid") ==
+                  static_cast<int64_t>(GetCurrentProcessId()),
+              "pid 正确");
+    }
+
+    {
+        const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+        char reqJson[256];
+        snprintf(reqJson, sizeof(reqJson),
+                 R"({"jsonrpc":"2.0","id":2,"method":"mem.read","params":{"addr":"0x%llX","size":2}})",
+                 static_cast<unsigned long long>(base));
+        json::Value req;
+        json::parse(reqJson, req);
+        const auto resp = d.dispatch(req);
+        check(resp.ok, "mem.read 成功");
+        check(resp.result.get_str("status") == "ok", "status 为 ok");
+        check(resp.result.get_str("hex") == "4D5A", "读到 4D5A (MZ)");
+    }
+
+    {
+        json::Value req;
+        json::parse(R"({"jsonrpc":"2.0","id":3,"method":"no.such"})", req);
+        const auto resp = d.dispatch(req);
+        check(!resp.ok, "未知方法返回错误");
+        check(resp.errorCode == ik::rpc::kMethodNotFound, "错误码为 MethodNotFound");
+    }
+
+    {
+        json::Value req;
+        json::parse(
+            R"({"jsonrpc":"2.0","id":4,"method":"mem.read","params":{"addr":"0x0","size":0}})",
+            req);
+        const auto resp = d.dispatch(req);
+        check(!resp.ok, "无效参数返回错误");
+        check(resp.errorCode == ik::rpc::kInvalidParams, "错误码为 InvalidParams");
+    }
+
+    {
+        const char* line = R"({"jsonrpc":"2.0","id":7,"method":"ping"})";
+        const std::string out = ik::rpc::handle_line(d, line, strlen(line));
+        check(out.find("\"id\":7") != std::string::npos, "响应回填 id");
+        check(!out.empty() && out.back() == '\n', "响应以换行结尾");
+        check(out.find("\"jsonrpc\":\"2.0\"") != std::string::npos, "响应含版本");
+    }
+
+    {
+        const char* line = "{not json";
+        const std::string out = ik::rpc::handle_line(d, line, strlen(line));
+        check(out.find("-32700") != std::string::npos, "解析错误返回 -32700");
+    }
+
+    {
+        const uint8_t bytes[] = {0x4D, 0x5A, 0x90, 0x00};
+        check(ik::rpc::to_hex(bytes, 4) == "4D5A9000", "hex 编码正确");
+    }
 }
 
 }  // namespace
@@ -184,7 +296,9 @@ int wmain() {
     test_rnd();
     test_ringlog();
     test_api();
-    test_pipe();
+    test_json();
+    test_mem();
+    test_rpc();
 
     std::printf("====================================\n");
     if (g_fail == 0) {

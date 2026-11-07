@@ -67,8 +67,19 @@ endfunction()
 if(INJECTKIT_BUILD_PAYLOAD)
     add_library(ikpayload SHARED
         src/payload/entry.cpp
+        src/payload/wrap_stub.cpp
     )
     ik_apply(ikpayload)
+    if(NOT MSVC)
+        # 拦掉 MinGW 运行库带进来的 OpenProcess（payload 根本不需要它）
+        target_link_options(ikpayload PRIVATE
+            -Wl,--wrap=__imp_OpenProcess
+            -Wl,--wrap=__imp_DuplicateHandle
+            -Wl,--wrap=__imp_SuspendThread
+            -Wl,--wrap=__imp_ResumeThread
+            -Wl,--wrap=__imp_SetThreadContext
+            -Wl,--wrap=__imp_GetThreadContext)
+    endif()
     # DLL 不需要 -static（会变大且没必要），但要剥符号
     target_compile_definitions(ikpayload PRIVATE INJECTKIT_PAYLOAD=1)
     set_target_properties(ikpayload PROPERTIES PREFIX "" OUTPUT_NAME "ikpayload")
@@ -86,8 +97,18 @@ endif()
 if(INJECTKIT_BUILD_CLIENT)
     add_executable(ikclient
         src/app/main.cpp
+        src/app/wrap_stub.cpp
     )
     ik_apply(ikclient)
+    if(NOT MSVC)
+        target_link_options(ikclient PRIVATE
+            -Wl,--wrap=__imp_OpenProcess
+            -Wl,--wrap=__imp_DuplicateHandle
+            -Wl,--wrap=__imp_SuspendThread
+            -Wl,--wrap=__imp_ResumeThread
+            -Wl,--wrap=__imp_SetThreadContext
+            -Wl,--wrap=__imp_GetThreadContext)
+    endif()
 endif()
 
 # ---------------- 离线自检 ----------------
